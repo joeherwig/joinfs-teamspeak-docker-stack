@@ -43,14 +43,12 @@ services:
 
   tsapi:
     build: ./tsquery_api
-    image: joeherwig/joinfs-tsapi:latest
+    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-tsapi:latest
     depends_on:
       teamspeak:
         condition: service_started
       ts3init:
         condition: service_completed_successfully
-    ports:
-      - 8081:8081
     environment:
       TS3_QUERY_HOST: teamspeak
       TS3_QUERY_PORT: "10011"
@@ -59,7 +57,7 @@ services:
       FLASK_DEBUG: ${FLASK_DEBUG:-0}
 
   joinfs:
-    image: joinfs/joinfs-console:latest
+    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-console:latest
     container_name: joinfs
     command:
       - --hub
@@ -85,12 +83,29 @@ services:
       - joinfs_data:/JoinFS-CONSOLE/JoinFS-CONSOLE
     ports:
       - "6112:6112/udp"
-      - "8765:8765"
     restart: unless-stopped
     depends_on:
       - teamspeak
       - tsapi
 
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      - tsapi
+      - joinfs
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
 volumes:
   db_data:
   joinfs_data:
+  caddy_data:
+  caddy_config:
