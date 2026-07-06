@@ -1,0 +1,96 @@
+services:
+  db:
+    image: mariadb
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: teamspeak
+    volumes:
+      - db_data:/var/lib/mysql
+
+  teamspeak:
+    image: teamspeak
+    restart: always
+    depends_on:
+      - db
+    volumes:
+      - ./query_ip_allowlist.txt:/var/ts3server/query_ip_allowlist.txt
+    ports:
+      - 9987:9987/udp
+      - 10011:10011
+      - 30033:30033
+    environment:
+      TS3SERVER_DB_PLUGIN: ts3db_mariadb
+      TS3SERVER_DB_SQLCREATEPATH: create_mariadb
+      TS3SERVER_DB_HOST: db
+      TS3SERVER_DB_USER: root
+      TS3SERVER_DB_PASSWORD: ${DB_ROOT_PASSWORD}
+      TS3SERVER_DB_NAME: teamspeak
+      TS3SERVER_DB_WAITUNTILREADY: 30
+      TS3SERVER_LICENSE: accept
+      TS3SERVER_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+
+  ts3init:
+    image: python:3.12-alpine
+    restart: "no"
+    depends_on:
+      - teamspeak
+    environment:
+      TS3_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+    volumes:
+      - ./ts3init.py:/ts3init.py:ro
+    command: python3 /ts3init.py
+
+  tsapi:
+    build: ./tsquery_api
+    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-tsapi:latest
+    depends_on:
+      teamspeak:
+        condition: service_started
+      ts3init:
+        condition: service_completed_successfully
+    ports:
+      - 8081:8081
+    environment:
+      TS3_QUERY_HOST: teamspeak
+      TS3_QUERY_PORT: "10011"
+      TS3_QUERY_USER: serveradmin
+      TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+      FLASK_DEBUG: ${FLASK_DEBUG:-0}
+
+  joinfs:
+    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-console:latest
+    container_name: joinfs
+    command:
+      - --hub
+      - --hubdomain
+      - "${JOINFS_HUB_DOMAIN}"
+      - --nosim
+      - --hubname
+      - "${JOINFS_HUB_NAME}"
+      - --hubport
+      - "6112"
+      - --background
+      - --nogui
+      - --whazzup
+      - --websocket
+      - --websocketport
+      - "8765"
+      - --comswebhookuri
+      - "http://tsapi:8081/usertochannel"
+      - --comswebhookmethod
+      - PUT
+      - --websocketlog
+    volumes:
+      - joinfs_data:/JoinFS-CONSOLE/JoinFS-CONSOLE
+    ports:
+      - "6112:6112/udp"
+      - "8765:8765"
+    restart: unless-stopped
+    depends_on:
+      - teamspeak
+      - tsapi
+
+volumes:
+  db_data:
+  joinfs_data:

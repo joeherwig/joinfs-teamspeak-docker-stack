@@ -1,0 +1,314 @@
+#cloud-config
+#
+# Hetzner Cloud user-data for joinfs-teamspeak-docker-stack
+#
+# PREREQUISITE: Select "Docker CE" from the Hetzner Apps tab when creating the
+# server — Docker and Docker Compose are pre-installed.
+#
+# Before deploying, replace these CHANGE_ME_* values below:
+#   DB_ROOT_PASSWORD / TS3_SERVERADMIN_PASSWORD        →  openssl rand -base64 18
+#   CHANGE_ME_DOCKERHUB_LOGIN_USERNAME / _TOKEN         →  your OWN Docker Hub account +
+#                                                          a read-only PAT (hub.docker.com →
+#                                                          Account Settings → Security). This
+#                                                          is only used to raise Docker Hub's
+#                                                          anonymous pull-rate limit — it does
+#                                                          NOT need to match DOCKERHUB_USERNAME
+#                                                          below, which selects whose images to pull.
+#
+# The joinfs.service systemd unit below runs on every boot and on every manual
+# `systemctl restart joinfs.service`:
+#   1. Pulls the latest images from Docker Hub
+#   2. Recreates containers with those images
+# It intentionally does NOT delete Docker volumes, so the database, TeamSpeak
+# channels/permissions, and JoinFS state all persist across restarts and reboots.
+
+write_files:
+
+  - path: /opt/joinfs/.env
+    permissions: '0600'
+    owner: root:root
+    content: |
+      DB_ROOT_PASSWORD=CHANGE_ME_DB_ROOT_PASSWORD
+      TS3_SERVERADMIN_PASSWORD=CHANGE_ME_TS3_SERVERADMIN_PASSWORD
+      JOINFS_HUB_NAME=My Hub Name
+      JOINFS_HUB_DOMAIN=PLACEHOLDER
+      DOCKERHUB_USERNAME=joeherwig
+      FLASK_DEBUG=0
+
+  - path: /opt/joinfs/query_ip_allowlist.txt
+    permissions: '0644'
+    owner: root:root
+    content: |
+      127.0.0.1
+      ::1
+      172.0.0.0/8
+      10.0.0.0/8
+
+  - path: /opt/joinfs/ts3init.py
+    permissions: '0644'
+    owner: root:root
+    content: |
+      #!/usr/bin/env python3
+      import os, socket, sys, time
+
+      HOST = 'teamspeak'
+      PORT = 10011
+      ADMIN_PASS = os.environ['TS3_SERVERADMIN_PASSWORD']
+
+      BOOL_PERMS = [
+          'b_virtualserver_client_list',
+          'b_virtualserver_channel_list',
+          'b_client_move_others',
+          'b_channel_create_permanent',
+          'b_channel_create_semi_permanent',
+          'b_channel_create_temporary',
+          'b_channel_modify_make_permanent',
+          'b_channel_modify_make_temporary',
+      ]
+      INT_PERMS = [
+          ('i_client_move_power', 100),
+          ('i_channel_create_child_modify_power', 75),
+          ('i_channel_modify_power', 75),
+      ]
+
+      def ts_escape(s):
+          return s.replace('\\', '\\\\').replace(' ', '\\s').replace('|', '\\p').replace('/', '\\/')
+
+      def recv_until_error(sock, timeout=5):
+          sock.settimeout(timeout)
+          buf = b''
+          try:
+              while True:
+                  chunk = sock.recv(4096)
+                  if not chunk:
+                      break
+                  buf += chunk
+                  if any(l.startswith('error id=') for l in buf.decode(errors='ignore').splitlines()):
+                      break
+          except socket.timeout:
+              pass
+          return buf.decode(errors='ignore')
+
+      def send_cmd(sock, text):
+          sock.sendall((text + '\n').encode())
+          return recv_until_error(sock)
+
+      def parse_ts(raw):
+          items = []
+          for part in raw.split('|'):
+              obj = {}
+              for token in part.split():
+                  if '=' in token:
+                      k, v = token.split('=', 1)
+                      obj[k] = v.replace('\\s', ' ').replace('\\p', '|')
+              if obj:
+                  items.append(obj)
+          return items
+
+      def open_session(retries=40, delay=5):
+          escaped_pass = ts_escape(ADMIN_PASS)
+          for attempt in range(1, retries + 1):
+              sock = None
+              try:
+                  print(f"Attempt {attempt}/{retries}: connecting to {HOST}:{PORT}...", flush=True)
+                  sock = socket.create_connection((HOST, PORT), timeout=5)
+                  banner = recv_until_error(sock, timeout=3)
+                  if not banner.strip():
+                      print("  No banner received (TS3 initializing), waiting 20s...", flush=True)
+                      sock.close()
+                      time.sleep(20)
+                      continue
+                  resp = send_cmd(sock, f'login serveradmin {escaped_pass}')
+                  if 'error id=0' not in resp:
+                      print(f"  Login failed: {resp.strip()}", flush=True)
+                      sock.close()
+                      time.sleep(delay)
+                      continue
+                  resp = send_cmd(sock, 'use sid=1')
+                  if 'error id=0' not in resp:
+                      print(f"  use sid=1 failed: {resp.strip()}", flush=True)
+                      sock.close()
+                      time.sleep(delay)
+                      continue
+                  print("  Connected and logged in.", flush=True)
+                  return sock
+              except OSError as exc:
+                  print(f"  Connection error: {exc}", flush=True)
+                  if sock:
+                      sock.close()
+                  time.sleep(delay)
+          sys.exit(f"ERROR: Could not establish a working TS3 session after {retries} attempts.")
+
+      def main():
+          sock = open_session()
+          groups = parse_ts(send_cmd(sock, 'servergrouplist'))
+          admin_group = next(
+              (g for g in groups if g.get('name') == 'Server Admin' and g.get('type') == '1'),
+              None,
+          )
+          sgid = admin_group['sgid'] if admin_group else '6'
+          label = admin_group['name'] if admin_group else 'sgid=6 (fallback)'
+          print(f"Granting permissions to server group sgid={sgid} ({label})", flush=True)
+          for perm in BOOL_PERMS:
+              resp = send_cmd(sock, f'servergroupaddperm sgid={sgid} permsid={perm} permvalue=1 permnegated=0 permskip=0')
+              ok = 'error id=0' in resp or 'error id=2702' in resp
+              print(f"  {'OK  ' if ok else 'WARN'} {perm}", flush=True)
+          for perm, value in INT_PERMS:
+              resp = send_cmd(sock, f'servergroupaddperm sgid={sgid} permsid={perm} permvalue={value} permnegated=0 permskip=0')
+              ok = 'error id=0' in resp or 'error id=2702' in resp
+              print(f"  {'OK  ' if ok else 'WARN'} {perm}={value}", flush=True)
+          send_cmd(sock, 'quit')
+          sock.close()
+          print("TS3 permission setup complete.", flush=True)
+
+      if __name__ == '__main__':
+          main()
+
+  - path: /opt/joinfs/compose.yaml
+    permissions: '0644'
+    owner: root:root
+    content: |
+      services:
+        db:
+          image: mariadb
+          restart: always
+          environment:
+            MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+            MYSQL_DATABASE: teamspeak
+          volumes:
+            - db_data:/var/lib/mysql
+
+        teamspeak:
+          image: teamspeak
+          restart: always
+          depends_on:
+            - db
+          volumes:
+            - /opt/joinfs/query_ip_allowlist.txt:/var/ts3server/query_ip_allowlist.txt
+          ports:
+            - 9987:9987/udp
+            - 10011:10011
+            - 30033:30033
+          environment:
+            TS3SERVER_DB_PLUGIN: ts3db_mariadb
+            TS3SERVER_DB_SQLCREATEPATH: create_mariadb
+            TS3SERVER_DB_HOST: db
+            TS3SERVER_DB_USER: root
+            TS3SERVER_DB_PASSWORD: ${DB_ROOT_PASSWORD}
+            TS3SERVER_DB_NAME: teamspeak
+            TS3SERVER_DB_WAITUNTILREADY: 30
+            TS3SERVER_LICENSE: accept
+            TS3SERVER_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+
+        ts3init:
+          image: python:3.12-alpine
+          restart: "no"
+          depends_on:
+            teamspeak:
+              condition: service_started
+          environment:
+            TS3_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+          volumes:
+            - /opt/joinfs/ts3init.py:/ts3init.py:ro
+          command: python3 /ts3init.py
+
+        tsapi:
+          image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-tsapi:latest
+          restart: always
+          depends_on:
+            teamspeak:
+              condition: service_started
+            ts3init:
+              condition: service_completed_successfully
+          ports:
+            - 8081:8081
+          environment:
+            TS3_QUERY_HOST: teamspeak
+            TS3_QUERY_PORT: "10011"
+            TS3_QUERY_USER: serveradmin
+            TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+            FLASK_DEBUG: ${FLASK_DEBUG:-0}
+
+        joinfs:
+          image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-console:latest
+          container_name: joinfs
+          restart: unless-stopped
+          depends_on:
+            - teamspeak
+            - tsapi
+          command:
+            - --hub
+            - --hubdomain
+            - "${JOINFS_HUB_DOMAIN}"
+            - --nosim
+            - --hubname
+            - "${JOINFS_HUB_NAME}"
+            - --hubport
+            - "6112"
+            - --background
+            - --nogui
+            - --whazzup
+            - --websocket
+            - --websocketport
+            - "8765"
+            - --comswebhookuri
+            - "http://tsapi:8081/usertochannel"
+            - --comswebhookmethod
+            - PUT
+            - --websocketlog
+          volumes:
+            - joinfs_data:/JoinFS-CONSOLE/JoinFS-CONSOLE
+          ports:
+            - "6112:6112/udp"
+            - "8765:8765"
+
+      volumes:
+        db_data:
+        joinfs_data:
+
+  - path: /etc/systemd/system/joinfs.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=JoinFS Docker Compose Stack
+      After=docker.service network-online.target
+      Requires=docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/opt/joinfs
+
+      # '-' prefix means failure is non-fatal (nothing to remove on first boot).
+      # Note: no `--volumes` here — this intentionally preserves the DB, TeamSpeak
+      # channels/permissions, and JoinFS state across every restart/reboot.
+      ExecStartPre=-/usr/bin/docker compose --env-file .env down --remove-orphans
+
+      # Pull latest images so every boot/restart uses fresh code from Docker Hub
+      ExecStartPre=/usr/bin/docker compose --env-file .env pull
+
+      ExecStart=/usr/bin/docker compose --env-file .env up -d
+
+      ExecStop=/usr/bin/docker compose --env-file .env down
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Resolve the server's public IP and write it into .env
+  - |
+    PUBLIC_IP=$(curl -sf http://169.254.169.254/hetzner/v1/metadata/public-ipv4 \
+                || curl -sf https://api.ipify.org)
+    sed -i "s/JOINFS_HUB_DOMAIN=PLACEHOLDER/JOINFS_HUB_DOMAIN=${PUBLIC_IP}/" /opt/joinfs/.env
+
+  # Authenticate with Docker Hub (credentials persist in /root/.docker/config.json
+  # for future reboots) to raise the anonymous pull-rate limit. Replace both values
+  # with your own Docker Hub account and a read-only PAT.
+  - echo "CHANGE_ME_DOCKERHUB_TOKEN" | docker login --username "CHANGE_ME_DOCKERHUB_LOGIN_USERNAME" --password-stdin
+
+  # Register the service (runs on every future reboot) and start it now
+  - systemctl daemon-reload
+  - systemctl enable joinfs.service
+  - systemctl start joinfs.service
