@@ -1,0 +1,17 @@
+{$CADDY_DOMAIN} {
+	# JoinFS live aircraft WebSocket feed, exposed at /ws/ and proxied to the
+	# JoinFS hub's websocket listener at its own root path.
+	handle_path /ws/* {
+		reverse_proxy joinfs:8765
+	}
+
+	# tsapi's Flask routes, proxied as-is (no path rewriting).
+	@api path /usertochannel* /users* /channels* /channel* /move*
+	handle @api {
+		reverse_proxy tsapi:8081
+	}
+
+	handle {
+		respond "Not Found" 404
+	}
+}

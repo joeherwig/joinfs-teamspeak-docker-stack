@@ -7,6 +7,12 @@
 #
 # Before deploying, replace these CHANGE_ME_* values below:
 #   DB_ROOT_PASSWORD / TS3_SERVERADMIN_PASSWORD        →  openssl rand -base64 18
+#   CHANGE_ME_CADDY_DOMAIN                              →  a real domain name you control, with
+#                                                          a DNS A/AAAA record already pointing at
+#                                                          this server's public IP. Caddy uses it
+#                                                          to request a Let's Encrypt certificate,
+#                                                          which requires ports 80+443 reachable
+#                                                          from the internet.
 #   CHANGE_ME_DOCKERHUB_LOGIN_USERNAME / _TOKEN         →  your OWN Docker Hub account +
 #                                                          a read-only PAT (hub.docker.com →
 #                                                          Account Settings → Security). This
@@ -32,8 +38,31 @@ write_files:
       TS3_SERVERADMIN_PASSWORD=CHANGE_ME_TS3_SERVERADMIN_PASSWORD
       JOINFS_HUB_NAME=My Hub Name
       JOINFS_HUB_DOMAIN=PLACEHOLDER
+      CADDY_DOMAIN=CHANGE_ME_CADDY_DOMAIN
       DOCKERHUB_USERNAME=joeherwig
       FLASK_DEBUG=0
+
+  - path: /opt/joinfs/Caddyfile
+    permissions: '0644'
+    owner: root:root
+    content: |
+      {$CADDY_DOMAIN} {
+      	# JoinFS live aircraft WebSocket feed, exposed at /ws/ and proxied to the
+      	# JoinFS hub's websocket listener at its own root path.
+      	handle_path /ws/* {
+      		reverse_proxy joinfs:8765
+      	}
+
+      	# tsapi's Flask routes, proxied as-is (no path rewriting).
+      	@api path /usertochannel* /users* /channels* /channel* /move*
+      	handle @api {
+      		reverse_proxy tsapi:8081
+      	}
+
+      	handle {
+      		respond "Not Found" 404
+      	}
+      }
 
   - path: /opt/joinfs/query_ip_allowlist.txt
     permissions: '0644'
@@ -220,8 +249,6 @@ write_files:
               condition: service_started
             ts3init:
               condition: service_completed_successfully
-          ports:
-            - 8081:8081
           environment:
             TS3_QUERY_HOST: teamspeak
             TS3_QUERY_PORT: "10011"
@@ -260,11 +287,28 @@ write_files:
             - joinfs_data:/JoinFS-CONSOLE/JoinFS-CONSOLE
           ports:
             - "6112:6112/udp"
-            - "8765:8765"
+
+        caddy:
+          image: caddy:2
+          restart: always
+          depends_on:
+            - tsapi
+            - joinfs
+          ports:
+            - "80:80"
+            - "443:443"
+          environment:
+            CADDY_DOMAIN: ${CADDY_DOMAIN}
+          volumes:
+            - /opt/joinfs/Caddyfile:/etc/caddy/Caddyfile:ro
+            - caddy_data:/data
+            - caddy_config:/config
 
       volumes:
         db_data:
         joinfs_data:
+        caddy_data:
+        caddy_config:
 
   - path: /etc/systemd/system/joinfs.service
     permissions: '0644'

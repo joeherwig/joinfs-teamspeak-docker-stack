@@ -1,20 +1,24 @@
 # joinfs-teamspeak-docker-stack
 
-Docker Compose stack that combines a **JoinFS Hub**, a **TeamSpeak 3 server**, and a
+Docker Compose stack that combines a **JoinFS Hub**, a **TeamSpeak 3 server**, a
 **TS3 Query API** (Flask) that automatically moves pilots to TeamSpeak channels based
-on their COM frequency when they connect to the JoinFS hub.
+on their COM frequency when they connect to the JoinFS hub, and a **Caddy** reverse proxy
+that terminates TLS for the WebSocket feed and the API.
 
 ```
 JoinFS client  →  JoinFS Hub (6112 UDP)
-                       ↓ webhook PUT /usertochannel
-               TS Query API (8081)
-                       ↓ ServerQuery (10011)
-               TeamSpeak 3 (9987 UDP)
+
+Browser/client →  Caddy (443, TLS)
+                       ├── /ws/*  → JoinFS WebSocket (8765)
+                       └── /usertochannel, /users, /channels, /channel, /move
+                                  → TS Query API (8081)
+                                       ↓ ServerQuery (10011)
+                                  TeamSpeak 3 (9987 UDP)
 ```
 
 ## Overview
 
-The stack is four containers plus a one-shot bootstrap job:
+The stack is five containers plus a one-shot bootstrap job:
 
 - **`joinfs`** — [JoinFS](https://joinfs.net) running in hub mode (`--hub --nogui --background`).
   This is the flight-sim networking session pilots connect to. It fires a webhook every time a
@@ -32,6 +36,10 @@ The stack is four containers plus a one-shot bootstrap job:
 - **`ts3init`** — a one-shot job (runs once per fresh database, not on every restart) that logs in as
   `serveradmin` and grants the "Server Admin" server group the permissions `tsapi` needs (list
   clients/channels, move clients, create/edit channels).
+- **`caddy`** — reverse proxy that terminates TLS on port 443 (auto-provisioning a Let's Encrypt
+  certificate for `CADDY_DOMAIN`) and routes `/ws/*` to the JoinFS WebSocket and the tsapi routes
+  to `tsapi`. `tsapi` and the JoinFS WebSocket are no longer published directly on the host — see
+  [TLS with Caddy](#tls-with-caddy).
 
 ## Services
 
@@ -41,6 +49,7 @@ The stack is four containers plus a one-shot bootstrap job:
 | `db` | `mariadb` (official) | Database for TeamSpeak |
 | `tsapi` | `${DOCKERHUB_USERNAME}/joinfs-tsapi` | Flask API — moves TS3 clients by COM frequency |
 | `joinfs` | `${DOCKERHUB_USERNAME}/joinfs-console` | JoinFS Hub — fires a webhook on COM change |
+| `caddy` | `caddy:2` | TLS reverse proxy for the WebSocket feed and tsapi routes (port 443) |
 
 `joinfs-console`'s source isn't part of this repo — it's built and published from wherever
 its own source lives; this repo only consumes the prebuilt image.
@@ -76,7 +85,8 @@ cd joinfs-teamspeak-docker-stack
 ```bash
 cp .env.example .env
 # then edit .env and fill in DB_ROOT_PASSWORD, TS3_SERVERADMIN_PASSWORD, JOINFS_HUB_NAME,
-# and JOINFS_HUB_DOMAIN (your server's public IP or hostname)
+# JOINFS_HUB_DOMAIN (your server's public IP or hostname), and CADDY_DOMAIN (a real domain
+# name with DNS already pointing at this server — see TLS with Caddy below)
 ```
 
 ### 3. First boot — retrieve the TeamSpeak admin password
@@ -147,7 +157,7 @@ When a pilot changes COM1 in the sim, JoinFS fires:
 PUT http://tsapi:8081/usertochannel
 {
   "comsupdate": [
-    { "callsign": "ZK-QMQ", "nickname": "FSC740", "com1": "124.85", "com2": "124.85" }
+    { "callsign": "AFR2222", "nickname": "Joe", "com1": "124.855", "com2": "122.800" }
   ]
 }
 ```
@@ -195,37 +205,6 @@ are ever flagged temporary and auto-removed by TeamSpeak when they empty out.
   shown in everyone's JoinFS hub list. It has nothing to do with TeamSpeak channels or topics.
 - **Callsign** is the pilot/aircraft identifier JoinFS sends in the webhook payload, used only
   to find which TS3 client to move (the nickname-matching rule in step 1 above).
-
----
-
-## Updating a running server via SSH
-
-If the server was deployed via `hetzner-cloud-config.yaml` (see below), updating to the
-latest images is a single command:
-
-```bash
-ssh root@<server-ip>
-systemctl restart joinfs.service   # pulls latest images, recreates containers
-journalctl -u joinfs.service -f    # optional: watch pull/start progress
-```
-
-This is safe to run at any time — it does **not** delete the database, TeamSpeak
-channels/permissions, or JoinFS state, since those live in named Docker volumes that
-persist across restarts.
-
-If you changed `compose.yaml`, `ts3init.py`, or `query_ip_allowlist.txt` themselves (not
-just application code that gets rebuilt into an image), copy the updated files to
-`/opt/joinfs/` on the server (e.g. via `scp`) before restarting — those files were seeded
-once at first boot from the cloud-config and are not automatically kept in sync with this
-repo.
-
-For a manually-managed server (no systemd unit), the equivalent is:
-
-```bash
-cd joinfs-teamspeak-docker-stack
-git pull
-docker compose pull && docker compose up -d
-```
 
 ---
 
@@ -288,20 +267,183 @@ docker compose up --build -d
 | Port | Protocol | Service |
 |---|---|---|
 | 22 | TCP | SSH |
+| 80 | TCP | Caddy — Let's Encrypt ACME challenge (redirects to 443) |
+| 443 | TCP | Caddy — TLS for the JoinFS WebSocket (`/ws/`) and tsapi routes |
 | 6112 | UDP | JoinFS hub |
-| 8765 | TCP | JoinFS WebSocket |
 | 9987 | UDP | TeamSpeak voice |
 | 10011 | TCP | TeamSpeak ServerQuery |
 | 30033 | TCP | TeamSpeak file transfer |
 
+The JoinFS WebSocket (8765) and tsapi (8081) are intentionally **not** published on the
+host — they're only reachable through Caddy on 443. See [TLS with Caddy](#tls-with-caddy).
+
 ---
+
+## Updating a running server via SSH
+
+This covers how to pick up changes from this repo — a new commit, a new `tsapi` image
+published to Docker Hub, or an edit to one of the infra files — on a Hetzner server that's
+already up and running.
+
+### Step 1 — figure out what actually changed
+
+The server was seeded once, at first boot, from `hetzner-cloud-config.yaml`. It does **not**
+pull from this git repo on its own. So the update procedure depends on *which* files changed
+between what's on the server and what's in this repo now:
+
+| Changed | Lives on the server as | Needs manual copy? |
+|---|---|---|
+| `tsquery_api/` (tsapi source), or a new `joinfs-console` image tag | Docker image, pulled by `joinfs.service` | No — just restart the service (Step 3) |
+| `compose.yaml` | `/opt/joinfs/compose.yaml` | Yes (Step 2) |
+| `Caddyfile` | `/opt/joinfs/Caddyfile` | Yes (Step 2) |
+| `ts3init.py` | `/opt/joinfs/ts3init.py` | Yes (Step 2) |
+| `query_ip_allowlist.txt` | `/opt/joinfs/query_ip_allowlist.txt` | Yes (Step 2) |
+| `hetzner-cloud-config.yaml` itself | only used at first boot (cloud-init) | No effect on a running server |
+
+If you're not sure, `git diff` against the commit you last deployed and check whether any of
+the four file paths above show up.
+
+### Step 2 — copy infra file changes first (if any)
+
+If `compose.yaml`, `Caddyfile`, `ts3init.py`, or `query_ip_allowlist.txt` changed, copy the
+updated file(s) to `/opt/joinfs/` **before** restarting in Step 3, since `joinfs.service`
+reads them from there, not from git:
+
+```bash
+scp compose.yaml Caddyfile ts3init.py query_ip_allowlist.txt root@<server-ip>:/opt/joinfs/
+```
+
+(`scp` any subset of those four — only send the ones that actually changed. If nothing in
+the table above needs copying, skip straight to Step 3.)
+
+### Step 3 — restart the stack (always required)
+
+```bash
+ssh root@<server-ip>
+systemctl restart joinfs.service   # pulls latest images, recreates containers
+journalctl -u joinfs.service -f    # optional: watch pull/start progress, Ctrl+C to stop following
+```
+
+This is safe to run at any time, whether or not infra files changed — it does **not** delete
+the database, TeamSpeak channels/permissions, or JoinFS state, since those live in named
+Docker volumes that persist across restarts. If nothing but application code changed, this
+step alone is the full update.
+
+### Step 4 — verify
+
+```bash
+ssh root@<server-ip>
+docker compose -f /opt/joinfs/compose.yaml --env-file /opt/joinfs/.env ps
+docker compose -f /opt/joinfs/compose.yaml --env-file /opt/joinfs/.env logs tsapi   # must NOT show "TS3 login failed"
+docker compose -f /opt/joinfs/compose.yaml --env-file /opt/joinfs/.env logs caddy   # look for a successful certificate obtain/renew, no TLS errors
+```
+
+### Creating or updating `.env` on a running server
+
+`.env` is never part of this repo (it's gitignored) and the Hetzner cloud-config only writes
+`/opt/joinfs/.env` once, on first boot — so changing a value later (rotating a password,
+fixing a `CHANGE_ME_*` placeholder, adding a newly-introduced variable like `CADDY_DOMAIN`)
+means editing it directly on the server:
+
+```bash
+ssh root@<server-ip>
+nano /opt/joinfs/.env        # edit values, then save (Ctrl+O, Enter, Ctrl+X in nano)
+systemctl restart joinfs.service
+```
+
+To recreate it from scratch instead (e.g. it was deleted, or you want to start clean), copy
+`.env.example` from your local clone of the repo up to the server, then fill it in:
+
+```bash
+scp .env.example root@<server-ip>:/opt/joinfs/.env
+ssh root@<server-ip>
+nano /opt/joinfs/.env         # fill in every value — none of the CHANGE_ME_*/blank
+                              # placeholders work as-is
+chmod 600 /opt/joinfs/.env
+systemctl restart joinfs.service
+```
+
+Either way, verify afterwards with the same commands as [Step 4](#step-4--verify) above.
+
+### Manually-managed server (no systemd unit)
+
+If the server wasn't set up via `hetzner-cloud-config.yaml` (e.g. you cloned the repo
+directly onto it, per [Setup](#setup)), updating is a normal `git pull`:
+
+```bash
+ssh root@<server-ip>
+cd joinfs-teamspeak-docker-stack
+git pull
+docker compose pull && docker compose up -d
+```
+
+---
+
+## TLS with Caddy
+
+The `caddy` container terminates TLS on port 443 for everything external clients need:
+
+- `https://<CADDY_DOMAIN>/ws/` — proxies (with the `/ws` prefix stripped) to the JoinFS
+  WebSocket feed on `joinfs:8765`.
+- `https://<CADDY_DOMAIN>/usertochannel`, `/users`, `/channels`, `/channel`, `/move` — proxy
+  as-is to `tsapi:8081`.
+
+Routing is defined in [Caddyfile](Caddyfile), read via a bind-mounted volume. The only
+configuration needed is `CADDY_DOMAIN` in `.env` — Caddy requests and renews a Let's Encrypt
+certificate for that domain automatically the first time it starts, which requires:
+
+- A DNS A/AAAA record for `CADDY_DOMAIN` already pointing at this server's public IP
+- Ports 80 and 443 reachable from the internet (80 is used for the ACME HTTP challenge, then
+  Caddy redirects HTTP → HTTPS)
+
+Certificates and Caddy's internal state persist in the `caddy_data`/`caddy_config` named
+volumes, so renewals survive container restarts. `tsapi` (8081) and the JoinFS WebSocket
+(8765) are not published on the host directly — only Caddy is, on 80/443.
+
+If you change [Caddyfile](Caddyfile) itself, see
+[Updating a running server via SSH](#updating-a-running-server-via-ssh) for how to get it
+onto an already-deployed server.
 
 ## API endpoints (tsapi)
 
+Reachable through Caddy at `https://<CADDY_DOMAIN>/<path>` (see [TLS with Caddy](#tls-with-caddy)).
+
 | Method | Path | Description |
 |---|---|---|
-| `PUT` | `/usertochannel` | Move pilot to COM frequency channel (called by JoinFS webhook) |
+| `PUT` | **`/usertochannel`** | Move pilot to COM frequency channel (called by JoinFS webhook) |
 | `GET` | `/users` | List connected TS3 clients |
 | `GET` | `/channels` | List TS3 channels |
 | `PUT` | `/channel` | Create a channel manually |
 | `PUT` | `/move` | Move a client by clid/cid |
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome.
+
+- For bugs or feature requests, open a GitHub issue describing what you expected vs. what
+  happened (include relevant `docker compose logs` output where applicable).
+- For pull requests: fork the repo, branch off `main`, and keep changes focused — a PR that
+  fixes one thing is much easier to review than one that bundles unrelated cleanup.
+- This repo only contains `tsquery_api/` (Flask) and the Docker Compose / Caddy / cloud-init
+  glue around it — `joinfs-console`'s source lives elsewhere, so JoinFS-specific bugs
+  (hub behavior, WebSocket payload format, etc.) aren't fixable here.
+- If you change `compose.yaml`, `Caddyfile`, `ts3init.py`, or `query_ip_allowlist.txt`, please
+  also update the matching copy embedded in `hetzner-cloud-config.yaml` (see
+  [Updating a running server via SSH](#updating-a-running-server-via-ssh)) so the two don't
+  drift apart.
+- By submitting a contribution, you agree it's licensed under the same terms as the rest of
+  this repo (see [License](#license)).
+
+---
+
+## License
+
+This project is licensed under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) (Attribution-NonCommercial-ShareAlike) —
+see [LICENSE](LICENSE) for the full terms.
+
+In short: you're free to use, share, and adapt this stack for your own flight-sim community,
+as long as you give attribution, don't use it (or a derivative of it) for a commercial
+purpose, and share any adaptations under the same license.

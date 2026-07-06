@@ -43,7 +43,7 @@ services:
 
   tsapi:
     build: ./tsquery_api
-    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-tsapi:latest
+    image: joeherwig/joinfs-tsapi:latest
     depends_on:
       teamspeak:
         condition: service_started
@@ -59,7 +59,7 @@ services:
       FLASK_DEBUG: ${FLASK_DEBUG:-0}
 
   joinfs:
-    image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-console:latest
+    image: joinfs/joinfs-console:latest
     container_name: joinfs
     command:
       - --hub
