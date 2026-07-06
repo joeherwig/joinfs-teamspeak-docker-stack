@@ -242,7 +242,7 @@ write_files:
           command: python3 /ts3init.py
 
         tsapi:
-          image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-tsapi:latest
+          image: joeherwig/joinfs-tsapi:latest
           restart: always
           depends_on:
             teamspeak:
@@ -257,7 +257,8 @@ write_files:
             FLASK_DEBUG: ${FLASK_DEBUG:-0}
 
         joinfs:
-          image: ${DOCKERHUB_USERNAME:-joeherwig}/joinfs-console:latest
+          image: joeherwig/joinfs-console:latest
+
           container_name: joinfs
           restart: unless-stopped
           depends_on:
