@@ -180,6 +180,11 @@ PUT http://tsapi:8081/usertochannel
    step 3 above, and the move succeeded* — flip it to non-permanent so TeamSpeak's own
    built-in cleanup deletes it once it's empty.
 
+### If you don't want automatic TS channel switching
+Sometimes it happens that you want to chat on one fixed TS channel with your friends while having some AI ATC tools running and you need to change frequencies in the sim.
+That's easily possible. 
+To avoid unwanted automatic channel switching is to ensure the TS-Username doesn't match with the callsign reported from JoinFS. The same setup and callsign would not match if your TS-User doesn't match that criteria. To block that feature, just rename your TS-User (like adding a _ as first character or removing the callsign)
+
 ### The safety guarantee: manually created channels are never touched
 
 Step 5 is gated by an in-memory "did I just create this channel in this request" flag —
@@ -381,7 +386,7 @@ docker compose pull && docker compose up -d
 
 ## TLS with Caddy
 
-The `caddy` container terminates TLS on port 443 for everything external clients need:
+The `caddy` container terminates TLS on port 443 for everything external HTTPS/WSS clients need:
 
 - `https://<CADDY_DOMAIN>/ws/` — proxies (with the `/ws` prefix stripped) to the JoinFS
   WebSocket feed on `joinfs:8765`.
