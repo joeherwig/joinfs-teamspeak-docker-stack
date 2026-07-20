@@ -37,6 +37,13 @@ services:
       - teamspeak
     environment:
       TS3_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+    # TS3_CONFIG is delivered via env_file (not the environment: map above) because
+    # it's a JSON blob — splicing it through ${TS3_CONFIG} interpolation would land
+    # raw JSON text into this YAML document, and JSON's braces/quotes collide with
+    # YAML flow-mapping syntax. env_file reads .env's KEY=VALUE lines directly,
+    # bypassing YAML interpolation entirely.
+    env_file:
+      - .env
     volumes:
       - ./ts3init.py:/ts3init.py:ro
     command: python3 /ts3init.py
@@ -100,6 +107,7 @@ services:
       - "443:443"
     environment:
       CADDY_DOMAIN: ${CADDY_DOMAIN}
+      TSAPI_EXPOSE_WRITE_ENDPOINTS: ${TSAPI_EXPOSE_WRITE_ENDPOINTS:-false}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

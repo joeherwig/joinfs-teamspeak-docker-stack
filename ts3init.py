@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-One-shot TS3 ServerQuery permission setup.
-Grants required permissions to the Server Admin group so tsapi works without manual configuration.
+One-shot TS3 ServerQuery bootstrap: permissions, server settings, and channels.
+Grants required permissions to the Server Admin group so tsapi works without manual
+configuration, then applies TS3_CONFIG (server settings + channel list) if set.
 """
+import json
 import os
 import socket
 import sys
@@ -28,6 +30,14 @@ INT_PERMS = [
     ('i_channel_create_child_modify_power', 75),
     ('i_channel_modify_power', 75),
 ]
+
+CHANNEL_TYPE_FLAGS = {
+    'permanent': {'channel_flag_permanent': '1'},
+    'semi_permanent': {'channel_flag_semi_permanent': '1'},
+    'temporary': {},
+}
+
+CHAT_PERMS = ['b_client_server_textmessage_send', 'b_client_channel_textmessage_send']
 
 
 def ts_escape(s):
@@ -112,7 +122,134 @@ def open_session(retries=40, delay=5):
     sys.exit(f"ERROR: Could not establish a working TS3 session after {retries} attempts.")
 
 
+def load_ts3_config():
+    """Parse the TS3_CONFIG env var (JSON). Returns {} if unset/empty."""
+    raw = os.environ.get('TS3_CONFIG', '').strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        sys.exit(f"ERROR: TS3_CONFIG is not valid JSON: {exc}")
+
+
+def apply_server_settings(sock, server_cfg):
+    """Apply server-wide settings (name, password, welcome message, host banner) via one serveredit call.
+
+    Only fields explicitly present in server_cfg are touched — anything absent is
+    left as whatever it already is.
+    """
+    parts = []
+
+    if 'name' in server_cfg:
+        parts.append(f"virtualserver_name={ts_escape(server_cfg['name'])}")
+
+    if 'password' in server_cfg:
+        # Plaintext over ServerQuery, same convention as channel passwords below —
+        # TS3 hashes it server-side. Empty string explicitly clears the password.
+        parts.append(f"virtualserver_password={ts_escape(server_cfg['password'])}")
+
+    if 'welcome_message' in server_cfg:
+        msg = server_cfg['welcome_message']
+        encoded = msg.encode('utf-8')
+        if len(encoded) > 1024:
+            encoded = encoded[:1024]
+            while encoded and (encoded[-1] & 0xC0) == 0x80:
+                encoded = encoded[:-1]  # don't split a multi-byte UTF-8 char
+            msg = encoded.decode('utf-8', errors='ignore')
+            print("  WARN virtualserver_welcomemessage truncated to 1024 bytes", flush=True)
+        parts.append(f"virtualserver_welcomemessage={ts_escape(msg)}")
+
+    hostbanner = server_cfg.get('hostbanner') or {}
+    if 'url' in hostbanner:
+        parts.append(f"virtualserver_hostbanner_url={ts_escape(hostbanner['url'])}")
+    if 'gfx_url' in hostbanner:
+        parts.append(f"virtualserver_hostbanner_gfx_url={ts_escape(hostbanner['gfx_url'])}")
+    if hostbanner:
+        parts.append(f"virtualserver_hostbanner_mode={int(hostbanner.get('mode', 0))}")
+
+    if not parts:
+        print("No server settings in TS3_CONFIG, skipping serveredit.", flush=True)
+        return
+
+    resp = send_cmd(sock, 'serveredit ' + ' '.join(parts))
+    ok = 'error id=0' in resp
+    print(f"  {'OK  ' if ok else 'WARN'} serveredit ({len(parts)} field(s))", flush=True)
+    if not ok:
+        print(f"    response: {resp.strip()}", flush=True)
+
+
+def apply_chat_permission(sock, server_cfg, groups):
+    """Toggle server-wide chat permissions on the 'Normal' server group, if explicitly configured."""
+    if 'allow_client_chat' not in server_cfg:
+        return
+
+    allow = bool(server_cfg['allow_client_chat'])
+    permvalue = '1' if allow else '0'
+
+    normal_group = next(
+        (g for g in groups if g.get('name') == 'Normal' and g.get('type') == '1'),
+        None,
+    )
+    sgid = normal_group['sgid'] if normal_group else '8'
+    label = normal_group['name'] if normal_group else 'sgid=8 (fallback)'
+    print(f"Setting allow_client_chat={allow} on server group sgid={sgid} ({label})", flush=True)
+
+    for perm in CHAT_PERMS:
+        resp = send_cmd(sock, f'servergroupaddperm sgid={sgid} permsid={perm} permvalue={permvalue} permnegated=0 permskip=0')
+        ok = 'error id=0' in resp or 'error id=2702' in resp  # 2702 = duplicate, already set
+        print(f"  {'OK  ' if ok else 'WARN'} {perm}={permvalue}", flush=True)
+
+
+def sync_channels(sock, channels_cfg):
+    """Create or update each configured channel so TS3_CONFIG stays the source of truth."""
+    if not channels_cfg:
+        return
+
+    existing = parse_ts(send_cmd(sock, 'channellist'))
+    by_name = {c.get('channel_name'): c for c in existing}
+
+    for entry in channels_cfg:
+        name = entry.get('name')
+        if not name:
+            print("  WARN channel entry missing 'name', skipping", flush=True)
+            continue
+
+        chan_type = entry.get('type', 'permanent')
+        type_flags = CHANNEL_TYPE_FLAGS.get(chan_type)
+        if type_flags is None:
+            print(f"  WARN unknown channel type '{chan_type}' for '{name}', defaulting to permanent", flush=True)
+            type_flags = CHANNEL_TYPE_FLAGS['permanent']
+
+        fields = [
+            f"channel_topic={ts_escape(entry.get('topic', ''))}",
+            f"channel_password={ts_escape(entry.get('password', ''))}",
+            f"channel_flag_permanent={type_flags.get('channel_flag_permanent', '0')}",
+            f"channel_flag_semi_permanent={type_flags.get('channel_flag_semi_permanent', '0')}",
+        ]
+
+        existing_channel = by_name.get(name)
+        if existing_channel is None:
+            parts = [f"channel_name={ts_escape(name)}"] + fields
+            resp = send_cmd(sock, 'channelcreate ' + ' '.join(parts))
+            ok = 'error id=0' in resp
+            print(f"  {'CREATED' if ok else 'WARN   '} channel '{name}'", flush=True)
+        else:
+            cid = existing_channel.get('cid')
+            parts = [f"cid={cid}"] + fields
+            resp = send_cmd(sock, 'channeledit ' + ' '.join(parts))
+            ok = 'error id=0' in resp
+            print(f"  {'UPDATED' if ok else 'WARN   '} channel '{name}' (cid={cid})", flush=True)
+
+        if not ok:
+            print(f"    response: {resp.strip()}", flush=True)
+
+
 def main():
+    config = load_ts3_config()
+    server_cfg = config.get('server') or {}
+    channels_cfg = config.get('channels') or []
+
     sock = open_session()
 
     groups = parse_ts(send_cmd(sock, 'servergrouplist'))
@@ -134,9 +271,13 @@ def main():
         ok = 'error id=0' in resp or 'error id=2702' in resp
         print(f"  {'OK  ' if ok else 'WARN'} {perm}={value}", flush=True)
 
+    apply_server_settings(sock, server_cfg)
+    apply_chat_permission(sock, server_cfg, groups)
+    sync_channels(sock, channels_cfg)
+
     send_cmd(sock, 'quit')
     sock.close()
-    print("TS3 permission setup complete.", flush=True)
+    print("TS3 bootstrap complete.", flush=True)
 
 
 if __name__ == '__main__':

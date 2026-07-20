@@ -5,9 +5,29 @@
 		reverse_proxy joinfs:8765
 	}
 
-	# tsapi's Flask routes, proxied as-is (no path rewriting).
-	@api path /usertochannel* /users* /channels* /channel* /move*
-	handle @api {
+	# Read-only tsapi routes are public by default.
+	@apiRead {
+		method GET
+		path /users* /channels*
+	}
+	handle @apiRead {
+		reverse_proxy tsapi:8081
+	}
+
+	# State-changing tsapi routes (create channels, move clients, the JoinFS
+	# webhook target) are closed to the public internet by default — tsapi has
+	# no authentication, and JoinFS itself calls /usertochannel over the internal
+	# Docker network directly (see compose.yaml), never through Caddy, so nothing
+	# legitimate needs this exposed externally. Set TSAPI_EXPOSE_WRITE_ENDPOINTS=true
+	# in .env (and restart caddy) to expose them publicly anyway — there is still
+	# no authentication on these routes once open, so only do this if you
+	# understand and accept that risk.
+	@apiWrite {
+		method PUT POST
+		path /usertochannel* /channel* /move*
+		expression `"{$TSAPI_EXPOSE_WRITE_ENDPOINTS}" == "true"`
+	}
+	handle @apiWrite {
 		reverse_proxy tsapi:8081
 	}
 

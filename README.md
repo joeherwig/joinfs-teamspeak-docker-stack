@@ -10,10 +10,14 @@ JoinFS client  →  JoinFS Hub (6112 UDP)
 
 Browser/client →  Caddy (443, TLS)
                        ├── /ws/*  → JoinFS WebSocket (8765)
-                       └── /usertochannel, /users, /channels, /channel, /move
+                       ├── /users, /channels  (public, read-only)
+                       └── /usertochannel, /channel, /move  (closed by default*)
                                   → TS Query API (8081)
                                        ↓ ServerQuery (10011)
                                   TeamSpeak 3 (9987 UDP)
+
+* JoinFS calls /usertochannel over the internal Docker network directly, not
+  through Caddy — see "Security: tsapi's public surface" below.
 ```
 
 ## Overview
@@ -33,9 +37,10 @@ The stack is five containers plus a one-shot bootstrap job:
 - **`teamspeak`** — the official TeamSpeak 3 server image. Pilots connect to it with a normal
   TeamSpeak 3 client for voice.
 - **`db`** — MariaDB, TeamSpeak's storage backend.
-- **`ts3init`** — a one-shot job (runs once per fresh database, not on every restart) that logs in as
-  `serveradmin` and grants the "Server Admin" server group the permissions `tsapi` needs (list
-  clients/channels, move clients, create/edit channels).
+- **`ts3init`** — a one-shot job (runs on every start) that logs in as `serveradmin` and grants
+  the "Server Admin" server group the permissions `tsapi` needs (list clients/channels, move
+  clients, create/edit channels), then applies `TS3_CONFIG` if set — server settings and a
+  declarative channel list — see [Server and channel provisioning](#server-and-channel-provisioning).
 - **`caddy`** — reverse proxy that terminates TLS on port 443 (auto-provisioning a Let's Encrypt
   certificate for `CADDY_DOMAIN`) and routes `/ws/*` to the JoinFS WebSocket and the tsapi routes
   to `tsapi`. `tsapi` and the JoinFS WebSocket are no longer published directly on the host — see
@@ -87,13 +92,29 @@ cp .env.example .env
 # then edit .env and fill in DB_ROOT_PASSWORD, TS3_SERVERADMIN_PASSWORD, JOINFS_HUB_NAME,
 # JOINFS_HUB_DOMAIN (your server's public IP or hostname), and CADDY_DOMAIN (a real domain
 # name with DNS already pointing at this server — see TLS with Caddy below)
+# Optionally also uncomment/edit TS3_CONFIG for a declarative server + channel
+# setup — see Server and channel provisioning below.
 ```
 
-### 3. First boot — retrieve the TeamSpeak admin password
+### 3. First boot — set the TeamSpeak admin password
 
-TeamSpeak generates a random `serveradmin` password on its very first start, unless you already
-set `TS3_SERVERADMIN_PASSWORD` in `.env` before the first start (recommended — then you can skip
-this step). Otherwise, capture the generated password:
+**Set `TS3_SERVERADMIN_PASSWORD` in `.env` to a password of your choosing *before* the very
+first `docker compose up`.** The official TeamSpeak image only auto-generates a random
+`serveradmin` password on its very first start (when the `db` volume is empty); pre-setting it
+here skips that entirely, and it's the only supported path if you're also using `TS3_CONFIG`
+(see [Server and channel provisioning](#server-and-channel-provisioning)) — `ts3init` needs a
+working login from its very first connection attempt to provision anything, and can't recover
+from a wrong password without a manual fix and restart. Once set, this password lives in the
+`db` volume and survives every future restart unchanged — TeamSpeak never regenerates or
+re-prompts for it later.
+
+> **This step is critical.** If the password is wrong, `tsapi` and `ts3init` will log
+> `TS3 login failed`/`Login failed` and nothing TS3-side will work.
+
+<details>
+<summary>Fallback: if you already started the stack without pre-setting it</summary>
+
+Capture the randomly-generated password from the logs, then fix `.env` and restart:
 
 ```bash
 docker compose up -d db teamspeak
@@ -107,10 +128,9 @@ You will see something like:
 password set to 'XXXXXXXXXXXXXXXX'
 ```
 
-Edit `.env` and set `TS3_SERVERADMIN_PASSWORD` to this value.
+Edit `.env` and set `TS3_SERVERADMIN_PASSWORD` to this value, then continue to step 4 below.
 
-> **This step is critical.** If the password is wrong, `tsapi` will log
-> `TS3 login failed` and no channel moves will happen.
+</details>
 
 ### 4. Start the full stack
 
@@ -127,6 +147,64 @@ docker compose logs joinfs   # look for "Opened UDP port 6112" and "Started hub"
 ```
 
 Open JoinFS on your PC — your hub should appear in the global hub list.
+
+---
+
+## Server and channel provisioning
+
+Set `TS3_CONFIG` in `.env` to a single-line JSON object to declaratively configure the
+TeamSpeak server and a set of channels — applied by `ts3init` on every start. Leave it unset
+for today's default behavior: no channels, default TS3 server settings, nothing touched.
+
+`ts3init` applies this as a **create-or-update sync**: a channel is matched by `name`, created
+if missing, and edited in place if it already exists (so editing `TS3_CONFIG` and restarting
+converges that channel to the new values, without duplicating it). Channels removed from
+`TS3_CONFIG`, or created by hand in a TeamSpeak client, are **never deleted** — `ts3init` only
+ever creates or edits, matching `tsapi`'s own no-delete
+[safety guarantee](#the-safety-guarantee-via-channel-switching-created-channels-are-never-touched).
+
+Example (every field is optional — see `.env.example` for the copy-pasteable version):
+
+```json
+{
+  "server": {
+    "name": "My Flightsim ATC",
+    "password": "letmein",
+    "welcome_message": "Welcome to [b]ATC HQ[/b]!",
+    "hostbanner": { "url": "https://example.com", "gfx_url": "https://example.com/banner.png", "mode": 1 },
+    "allow_client_chat": true
+  },
+  "channels": [
+    { "name": "ATC - Tower", "topic": "atc-tower", "type": "permanent" },
+    { "name": "Pilot Lounge", "type": "permanent", "password": "flyhigh" },
+    { "name": "Staff Only", "type": "semi_permanent", "password": "secret" }
+  ]
+}
+```
+
+### `server` — server-wide settings
+
+| Field | Maps to | Notes |
+|---|---|---|
+| `name` | `virtualserver_name` | Server name shown in the TeamSpeak client's server list/tree. |
+| `password` | `virtualserver_password` | Required to **connect to the server at all** — distinct from the per-channel `password` fields below. Sent as plaintext over ServerQuery (TS3 hashes it server-side), same as channel passwords. Present-but-empty (`""`) explicitly clears it; omit the key entirely to leave whatever's currently set untouched. |
+| `welcome_message` | `virtualserver_welcomemessage` | BBCode allowed (e.g. `[b]bold[/b]`, `[url]...[/url]`). TS3 hard-caps this at 1024 bytes — longer values are truncated with a warning logged by `ts3init`, not rejected outright. |
+| `hostbanner.url` | `virtualserver_hostbanner_url` | Click-through link when a client clicks the banner image. |
+| `hostbanner.gfx_url` | `virtualserver_hostbanner_gfx_url` | The banner image itself. |
+| `hostbanner.mode` | `virtualserver_hostbanner_mode` | `0` no adjust (default), `1` ignore aspect ratio, `2` keep aspect ratio. |
+| `allow_client_chat` | `b_client_server_textmessage_send` + `b_client_channel_textmessage_send` on the **"Normal" server group** | **Server-wide, not per-channel** — this affects server chat and every channel's chat equally; there's no per-channel chat toggle. Only touched if this key is explicitly present in `TS3_CONFIG`; if absent, whatever's currently set (TS3's own default, or a previous manual change) is left alone. |
+
+Every field is independently optional — `ts3init` only issues a ServerQuery call for fields
+that are actually present in `server`.
+
+### `channels[]` — declarative channel list
+
+| Field | Required | Notes |
+|---|---|---|
+| `name` | yes | Used to match this entry to an existing channel across restarts. |
+| `topic` | no | Defaults to empty. If you also use the automatic COM-frequency channel switching described in [How channel switching works](#how-channel-switching-works), avoid setting a topic that looks like a frequency (e.g. `124.855`) unless you're intentionally pre-provisioning a fixed ATC channel that way. |
+| `password` | no | Per-channel join password. Omit/empty for no password. |
+| `type` | no, default `permanent` | One of `permanent`, `semi_permanent`, `temporary` — maps to `channel_flag_permanent`/`channel_flag_semi_permanent` (neither set for `temporary`). |
 
 ---
 
@@ -185,11 +263,11 @@ Sometimes it happens that you want to chat on one fixed TS channel with your fri
 That's easily possible. 
 To avoid unwanted automatic channel switching is to ensure the TS-Username doesn't match with the callsign reported from JoinFS. The same setup and callsign would not match if your TS-User doesn't match that criteria. To block that feature, just rename your TS-User (like adding a _ as first character or removing the callsign)
 
-### The safety guarantee: manually created channels are never touched
+### The safety guarantee: via channel switching created channels are never touched
 
 Step 5 is gated by an in-memory "did I just create this channel in this request" flag —
-there is no `channeldelete` call anywhere in this codebase. If step 2 finds an
-**already-existing** channel via its topic — including one a TeamSpeak admin created by
+there is no `channeldelete` call anywhere in this implementation. If step 2 finds an
+**already-existing** channel via its topic — including a TeamSpeak admin created by
 hand through the TeamSpeak client — that flag is never set, so steps 3 and 5 are skipped
 entirely. The app moves the pilot into it and otherwise leaves it completely alone: no flag
 changes, no deletion, ever.
@@ -409,17 +487,37 @@ If you change [Caddyfile](Caddyfile) itself, see
 [Updating a running server via SSH](#updating-a-running-server-via-ssh) for how to get it
 onto an already-deployed server.
 
+## Security: tsapi's public surface
+
+`tsapi` (`tsquery_api/app.py`) has **no authentication** on any route — anything reachable
+through Caddy is reachable by anyone who knows `CADDY_DOMAIN`. Because of that, only
+`tsapi`'s **read-only** routes (`GET /users`, `GET /channels`) are public by default; the
+state-changing routes (`PUT /channel`, `PUT /move`, `PUT|POST /usertochannel`) return `404`
+from Caddy unless `TSAPI_EXPOSE_WRITE_ENDPOINTS=true` is set in `.env`.
+
+This doesn't affect the actual pilot-channel-switching feature: JoinFS calls `/usertochannel`
+directly over the internal Docker network (`http://tsapi:8081/usertochannel`, see
+`compose.yaml`), never through Caddy — so it works identically either way.
+
+> **Behavior change if you're upgrading an existing deployment:** earlier versions of this repo
+> proxied all of `tsapi`'s routes publicly, unconditionally. If something external was relying
+> on hitting `/channel` or `/move` directly through your domain, set
+> `TSAPI_EXPOSE_WRITE_ENDPOINTS=true` in `.env` and restart `caddy` to restore that — but note
+> there's still no authentication once it's open, so only do this if you understand and accept
+> that risk.
+
 ## API endpoints (tsapi)
 
-Reachable through Caddy at `https://<CADDY_DOMAIN>/<path>` (see [TLS with Caddy](#tls-with-caddy)).
+Reachable through Caddy at `https://<CADDY_DOMAIN>/<path>` (see [TLS with Caddy](#tls-with-caddy)
+and [Security: tsapi's public surface](#security-tsapis-public-surface) above).
 
-| Method | Path | Description |
-|---|---|---|
-| `PUT` | **`/usertochannel`** | Move pilot to COM frequency channel (called by JoinFS webhook) |
-| `GET` | `/users` | List connected TS3 clients |
-| `GET` | `/channels` | List TS3 channels |
-| `PUT` | `/channel` | Create a channel manually |
-| `PUT` | `/move` | Move a client by clid/cid |
+| Method | Path | Description | Public by default? |
+|---|---|---|---|
+| `GET` | `/users` | List connected TS3 clients | Yes |
+| `GET` | `/channels` | List TS3 channels | Yes |
+| `PUT` | **`/usertochannel`** | Move pilot to COM frequency channel (called by JoinFS webhook, internally — not through Caddy) | No — requires `TSAPI_EXPOSE_WRITE_ENDPOINTS=true` |
+| `PUT` | `/channel` | Create a channel manually | No — requires `TSAPI_EXPOSE_WRITE_ENDPOINTS=true` |
+| `PUT` | `/move` | Move a client by clid/cid | No — requires `TSAPI_EXPOSE_WRITE_ENDPOINTS=true` |
 
 ---
 
