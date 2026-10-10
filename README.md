@@ -33,9 +33,10 @@ The stack is five containers plus a one-shot bootstrap job:
 - **`teamspeak`** — the official TeamSpeak 3 server image. Pilots connect to it with a normal
   TeamSpeak 3 client for voice.
 - **`db`** — MariaDB, TeamSpeak's storage backend.
-- **`ts3init`** — a one-shot job (runs once per fresh database, not on every restart) that logs in as
-  `serveradmin` and grants the "Server Admin" server group the permissions `tsapi` needs (list
-  clients/channels, move clients, create/edit channels).
+- **`ts3init`** — a one-shot, idempotent job (safe to run on every `up`) that logs in as
+  `serveradmin`, grants the "Server Admin" server group the permissions `tsapi` needs (list
+  clients/channels, move clients, create/edit channels), creates the static channel tree and sets a
+  neutral welcome message — see [Static channels](#static-channels-and-becoming-server-admin).
 - **`caddy`** — reverse proxy that terminates TLS on port 443 (auto-provisioning a Let's Encrypt
   certificate for `CADDY_DOMAIN`) and routes `/ws/*` to the JoinFS WebSocket and the tsapi routes
   to `tsapi`. `tsapi` and the JoinFS WebSocket are no longer published directly on the host — see
@@ -146,6 +147,63 @@ This gives it the permissions it needs:
 | `TS3 login failed: error id=520` | Wrong password in `.env` | Re-run step 3 and update `.env`, then `docker compose restart tsapi` |
 | `TS3 login failed: error id=3329` | Too many failed logins — TS3 blocked the IP | Wait 5 min or restart `teamspeak`, then `docker compose restart tsapi` |
 | Connection refused / timeout | TS3 not ready yet | `docker compose restart tsapi` after TS3 is fully up |
+
+---
+
+## Static channels and becoming server admin
+
+### Static channels
+
+`ts3init` creates these permanent top-level channels, in this order: **UNICOM** (default channel,
+topic `122.800`, Opus Voice), FSC_Online, PMDG, Mediumgruppe, Rotwein Gruppe, Widebody,
+Erdsichtflieger, Low&Slow, Albatrosse, Segelflieger, Nordost, Troubleshooting, Helikopter,
+**Vorstand** (password protected), Englischkurs.
+
+- Channels are matched by name, so re-running creates nothing twice and never edits channels that
+  already exist (exception: TeamSpeak's initial "Default Channel" is converted to UNICOM; an existing
+  Vorstand channel without a password gets one once).
+- A channel you delete on purpose is re-created on the next `docker compose up`.
+- The Vorstand password comes from `TS3_VORSTAND_PASSWORD` in `.env` (required).
+- UNICOM's topic equals the frequency `122.800`, so JoinFS users tuned to that COM1 frequency are moved
+  into UNICOM by tsapi instead of a temporary channel.
+
+### Server title
+
+`ts3init` sets the server title to **fsc-ev.de + JoinFS 🛫** (override with `TS3_SERVER_NAME`). Unlike
+the other settings it is enforced on every `docker compose up`, so a title changed in the TeamSpeak
+client is reset on the next start.
+
+### Welcome message
+
+Nothing admin-related is shown to connecting users. `ts3init` sets a neutral welcome message
+(`TS3_WELCOME_MESSAGE`, default "Welcome to the JoinFS TeamSpeak server.") but only while the server
+still has an empty/default one. The serveradmin password and the first-start privilege key appear
+only in the container log (`docker compose logs teamspeak`).
+
+### Becoming server admin
+
+1. **Admin password (recommended, keep it in your key vault).** `TS3_SERVERADMIN_PASSWORD` from `.env`
+   is the `serveradmin` password. Connect with the TeamSpeak client, open its *ServerQuery Login*
+   dialog and log in with user `serveradmin` and that password. This grants admin rights for that
+   connection only, nothing is stored on your identity. `ts3init` removes TeamSpeak's unredeemed
+   first-start privilege key, so users are never prompted for a key on connect.
+2. **Privilege key (permanent admin on your identity, and clears the "privilege key" dialog).**
+   TeamSpeak creates a first-start key that is only logged on the very first boot. If the log is
+   gone, print it from the database:
+
+   ```bash
+   docker compose run --rm ts3init python3 /ts3init.py --keys
+   ```
+
+   The key described as `default serveradmin privilege key` is the one the dialog asks for. Or
+   generate a new one-time key on the docker host:
+
+   ```bash
+   docker compose run --rm ts3init python3 /ts3init.py --token
+   ```
+
+   Then use *Permissions → Use Privilege Key* in the client and paste it. Your identity joins the
+   Server Admin group permanently; the key is then used up.
 
 ---
 
