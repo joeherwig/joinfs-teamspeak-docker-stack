@@ -37,6 +37,9 @@ services:
       - teamspeak
     environment:
       TS3_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+      TS3_VORSTAND_PASSWORD: ${TS3_VORSTAND_PASSWORD:?set a password for the Vorstand channel in .env}
+      TS3_WELCOME_MESSAGE: ${TS3_WELCOME_MESSAGE:-}
+      TS3_SERVER_NAME: ${TS3_SERVER_NAME:-}
     volumes:
       - ./ts3init.py:/ts3init.py:ro
     command: python3 /ts3init.py
