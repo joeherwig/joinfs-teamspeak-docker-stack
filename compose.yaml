@@ -60,6 +60,51 @@ services:
       FLASK_DEBUG: ${FLASK_DEBUG:-0}
       ATC_CHANNEL_STALE_TIMEOUT: ${ATC_CHANNEL_STALE_TIMEOUT:-10800}
 
+  # --- ATIS agent (optional; enable with `docker compose --profile atis up -d`) -----------------------
+  # Reads the description of every *_ATIS channel, renders it with Piper and has a bot loop it in the channel.
+  # Neither service publishes a port; the bot's web API is reachable from the compose network only.
+  ts3audiobot:
+    profiles: ["atis"]
+    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.0}
+    restart: unless-stopped
+    depends_on:
+      - teamspeak
+    environment:
+      TS3_ADDRESS: teamspeak
+      ATIS_BOT_TOKEN: ${ATIS_BOT_TOKEN:-}
+    volumes:
+      - atis_audio:/data/audio:ro
+    read_only: true
+    tmpfs: ["/tmp", "/home/ts3ab"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+
+  atis-agent:
+    profiles: ["atis"]
+    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.0}
+    restart: unless-stopped
+    depends_on:
+      - teamspeak
+      - ts3audiobot
+    environment:
+      TS3_QUERY_HOST: teamspeak
+      TS3_QUERY_PORT: "10011"
+      TS3_QUERY_USER: serveradmin
+      TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+      ATIS_BOT_URL: http://ts3audiobot:58913
+      ATIS_BOT_TOKEN: ${ATIS_BOT_TOKEN:-}
+      ATIS_VOICE_MAP: ${ATIS_VOICE_MAP:-}
+      ATIS_LEAVE_DELAY: ${ATIS_LEAVE_DELAY:-30}
+      ATIS_MAX_IDLE: ${ATIS_MAX_IDLE:-0}
+    volumes:
+      - atis_audio:/data/audio
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+
   joinfs:
     image: joeherwig/joinfs-console:latest
 
@@ -112,5 +157,6 @@ services:
 volumes:
   db_data:
   joinfs_data:
+  atis_audio:
   caddy_data:
   caddy_config:
