@@ -1,19 +1,25 @@
 from flask import Flask, request, jsonify
 import os
 import telnetlib
+import re
 import time
 import logging
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+_DEBUG = os.getenv('FLASK_DEBUG', '0') == '1'
+_LOG_LEVEL = logging.DEBUG if _DEBUG else logging.INFO
+logging.basicConfig(level=_LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
 
 app = Flask(__name__)
-app.logger.setLevel(logging.DEBUG)
+app.logger.setLevel(_LOG_LEVEL)
+
+_SENSITIVE_HEADERS = {'authorization', 'cookie', 'proxy-authorization', 'x-api-key', 'x-auth-token'}
 
 
 @app.before_request
 def log_request():
     app.logger.info(">> %s %s", request.method, request.path)
-    app.logger.debug("   headers: %s", dict(request.headers))
+    app.logger.debug("   headers: %s", {k: ('<redacted>' if k.lower() in _SENSITIVE_HEADERS else v)
+                                        for k, v in request.headers.items()})
     if request.data:
         app.logger.debug("   body: %s", request.data.decode('utf-8', errors='replace'))
 
@@ -21,6 +27,24 @@ TS_HOST = os.getenv('TS3_QUERY_HOST', 'teamspeak')
 TS_PORT = int(os.getenv('TS3_QUERY_PORT', '10011'))
 TS_USER = os.getenv('TS3_QUERY_USER', 'serveradmin')
 TS_PASS = os.getenv('TS3_QUERY_PASSWORD')
+
+
+def _read_stale_timeout(default=10800):
+    """Seconds an ATC station channel may stay empty before TS3 removes it (1..65535, TS3 limit)."""
+    raw = os.getenv('ATC_CHANNEL_STALE_TIMEOUT', '').strip()
+    if not raw:
+        return default
+    try:
+        return max(1, min(65535, int(raw)))
+    except ValueError:
+        logging.warning("ATC_CHANNEL_STALE_TIMEOUT is not an integer, using default %s s", default)
+        return default
+
+
+ATC_STALE_TIMEOUT = _read_stale_timeout()
+ATC_DESCRIPTION_MAX_BYTES = 4000
+CALLSIGN_RE = re.compile(r'^[A-Za-z0-9_]{2,30}$')
+FREQUENCY_RE = re.compile(r'^\d{3}\.\d{1,3}$')
 
 
 def read_response(tn, timeout=5.0):
@@ -42,7 +66,16 @@ def read_response(tn, timeout=5.0):
 
 
 def ts_escape(s: str) -> str:
-    return s.replace('\\', '\\\\').replace(' ', '\\s').replace('|', '\\p').replace('/', '\\/')
+    return (s.replace('\\', '\\\\').replace(' ', '\\s').replace('|', '\\p').replace('/', '\\/')
+             .replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t').replace('\v', '\\v'))
+
+
+_UNESCAPES = {'s': ' ', 'p': '|', '/': '/', 'n': '\n', 'r': '\r', 't': '\t', 'v': '\v', '\\': '\\'}
+
+
+def ts_unescape(s: str) -> str:
+    """Inverse of ts_escape (single pass, so an escaped backslash followed by 's' stays intact)."""
+    return re.sub(r'\\(.)', lambda m: _UNESCAPES.get(m.group(1), m.group(0)), s)
 
 
 def open_session():
@@ -91,8 +124,7 @@ def parse_ts_response(raw: str):
                 if '=' not in token:
                     continue
                 k, v = token.split('=', 1)
-                v = v.replace('\\s', ' ').replace('\\p', '|').replace('\\/', '/')
-                obj[k] = v
+                obj[k] = ts_unescape(v)
             if obj:
                 out.append(obj)
     return out
@@ -245,6 +277,160 @@ def user_to_channel():
             continue
         results.append(process_single_com_update(callsign, com1))
 
+    return jsonify({'results': results})
+
+
+def _ts_error(raw: str):
+    """Return (id, message) of a failing ServerQuery response, or None on success."""
+    line = next((l for l in raw.splitlines() if l.startswith('error id=')), None)
+    if line is None:
+        return ('?', 'no response from TeamSpeak')
+    err = {}
+    for token in line.split():
+        if '=' in token:
+            k, v = token.split('=', 1)
+            err[k] = ts_unescape(v)
+    if err.get('id') == '0':
+        return None
+    return (err.get('id', '?'), err.get('msg', ''))
+
+
+def _truncate_utf8(text: str, max_bytes: int):
+    data = text.encode('utf-8')
+    if len(data) <= max_bytes:
+        return text, False
+    return data[:max_bytes].decode('utf-8', errors='ignore'), True
+
+
+def _is_temporary(channel: dict) -> bool:
+    return channel.get('channel_flag_permanent') != '1' and channel.get('channel_flag_semi_permanent') != '1'
+
+
+def process_station_update(entry):
+    """Create/update/remove the temporary channel for one ATC station report."""
+    if not isinstance(entry, dict):
+        return {'error': 'entry must be an object'}
+    callsign = entry.get('callsign')
+    com1 = entry.get('com1')
+    online = entry.get('online')
+    text = entry.get('text')
+    if not isinstance(callsign, str) or not CALLSIGN_RE.match(callsign):
+        return {'callsign': callsign if isinstance(callsign, str) else None,
+                'error': 'callsign is required (2-30 chars: letters, digits, underscore)'}
+    if not isinstance(online, bool):
+        return {'callsign': callsign, 'error': 'online (boolean) is required'}
+    if online and (not isinstance(com1, str) or not FREQUENCY_RE.match(com1)):
+        return {'callsign': callsign, 'error': 'com1 is required in the format 118.800'}
+    if text is not None and not isinstance(text, str):
+        return {'callsign': callsign, 'error': 'text must be a string'}
+
+    truncated = False
+    if text is not None:
+        text, truncated = _truncate_utf8(text, ATC_DESCRIPTION_MAX_BYTES)
+        if truncated:
+            logging.warning("atcstation: description for %s truncated to %d bytes", callsign, ATC_DESCRIPTION_MAX_BYTES)
+
+    def fail(raw, what):
+        err = _ts_error(raw)
+        logging.warning("atcstation: %s failed for %s: id=%s msg=%s", what, callsign, err[0], err[1])
+        return {'callsign': callsign, 'error': f'{what} failed (ts3 error {err[0]}: {err[1]})'}
+
+    tn = open_session()
+    try:
+        channels = parse_ts_response(send_cmd_on(tn, 'channellist -topic -flags'))
+        channel = next((c for c in channels if c.get('channel_name') == callsign), None)
+        result = {'callsign': callsign}
+
+        if not online:
+            if channel is None:
+                return {**result, 'action': 'noop'}
+            cid = int(channel['cid'])
+            if not _is_temporary(channel):
+                logging.info("atcstation: %s is not temporary, leaving it untouched", callsign)
+                return {**result, 'action': 'noop', 'cid': cid}
+            # TS3 refuses to delete an occupied channel (force=0): then expire it as soon as it is empty.
+            if _ts_error(send_cmd_on(tn, f'channeldelete cid={cid} force=0')) is None:
+                logging.info("atcstation: %s deleted (cid=%s)", callsign, cid)
+                return {**result, 'action': 'deleted', 'cid': cid}
+            raw = send_cmd_on(tn, f'channeledit cid={cid} channel_delete_delay=0')
+            err = _ts_error(raw)
+            if err is not None and err[0] != '1281':
+                return fail(raw, 'channeledit')
+            logging.info("atcstation: %s occupied, delete delay set to 0 (cid=%s)", callsign, cid)
+            return {**result, 'action': 'delete_pending', 'cid': cid, 'delete_delay': 0}
+
+        if channel is None:
+            # A pilot-created frequency channel (temporary, same topic) is renamed instead of duplicated.
+            adopt = next((c for c in channels
+                          if c.get('channel_topic', '').strip() == com1 and _is_temporary(c)), None)
+            if adopt is not None:
+                cid = int(adopt['cid'])
+                parts = [f'cid={cid}', f'channel_name={ts_escape(callsign)}',
+                         f'channel_delete_delay={ATC_STALE_TIMEOUT}']
+                if text is not None:
+                    parts.append(f'channel_description={ts_escape(text)}')
+                raw = send_cmd_on(tn, 'channeledit ' + ' '.join(parts))
+                if _ts_error(raw) is not None:
+                    return fail(raw, 'channeledit')
+                logging.info("atcstation: renamed pilot channel cid=%s to %s", cid, callsign)
+                return {**result, 'action': 'updated', 'cid': cid, 'topic': com1,
+                        'delete_delay': ATC_STALE_TIMEOUT, 'description_updated': text is not None,
+                        'description_truncated': truncated}
+            parts = [f'channel_name={ts_escape(callsign)}', f'channel_topic={ts_escape(com1)}',
+                     'channel_flag_temporary=1', f'channel_delete_delay={ATC_STALE_TIMEOUT}']
+            if text:
+                parts.append(f'channel_description={ts_escape(text)}')
+            raw = send_cmd_on(tn, 'channelcreate ' + ' '.join(parts))
+            if _ts_error(raw) is not None:
+                return fail(raw, 'channelcreate')
+            created = next((c for c in parse_ts_response(raw) if 'cid' in c), None)
+            logging.info("atcstation: %s created cid=%s", callsign, created and created['cid'])
+            return {**result, 'action': 'created', 'cid': int(created['cid']) if created else None,
+                    'topic': com1, 'delete_delay': ATC_STALE_TIMEOUT,
+                    'description_updated': bool(text), 'description_truncated': truncated}
+
+        cid = int(channel['cid'])
+        temporary = _is_temporary(channel)
+        edits = []
+        if channel.get('channel_topic', '') != com1:
+            edits.append(f'channel_topic={ts_escape(com1)}')
+        if temporary:
+            edits.append(f'channel_delete_delay={ATC_STALE_TIMEOUT}')
+        description_updated = False
+        if text is not None:
+            info = next(iter(parse_ts_response(send_cmd_on(tn, f'channelinfo cid={cid}'))), {})
+            if info.get('channel_description', '') != text:
+                edits.append(f'channel_description={ts_escape(text)}')
+                description_updated = True
+        action = 'unchanged'
+        if edits:
+            raw = send_cmd_on(tn, f'channeledit cid={cid} ' + ' '.join(edits))
+            err = _ts_error(raw)
+            if err is not None and err[0] != '1281':  # 1281 = nothing changed (e.g. delay already equal)
+                return fail(raw, 'channeledit')
+            if err is None:
+                action = 'updated'
+        return {**result, 'action': action, 'cid': cid, 'topic': com1,
+                'delete_delay': ATC_STALE_TIMEOUT if temporary else None,
+                'description_updated': description_updated, 'description_truncated': truncated}
+    finally:
+        close_session(tn)
+
+
+@app.route('/atcstation', methods=['PUT', 'POST'])
+def atc_station():
+    data = request.get_json(silent=True)
+    updates = data.get('comsupdate') if isinstance(data, dict) else None
+    if not updates or not isinstance(updates, list):
+        return jsonify({'error': 'comsupdate array is required'}), 400
+    results = []
+    for entry in updates:
+        try:
+            results.append(process_station_update(entry))
+        except Exception as exc:  # one broken entry must not abort the others
+            logging.exception("atcstation: unexpected error")
+            results.append({'callsign': entry.get('callsign') if isinstance(entry, dict) else None,
+                            'error': f'internal error: {type(exc).__name__}'})
     return jsonify({'results': results})
 
 

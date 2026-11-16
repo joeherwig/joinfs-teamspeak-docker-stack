@@ -6,7 +6,7 @@
 	}
 
 	# tsapi's Flask routes, proxied as-is (no path rewriting).
-	@api path /usertochannel* /users* /channels* /channel* /move*
+	@api path /usertochannel* /users* /channels* /channel* /move* /atcstation*
 	handle @api {
 		reverse_proxy tsapi:8081
 	}

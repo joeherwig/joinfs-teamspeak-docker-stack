@@ -10,7 +10,7 @@ JoinFS client  →  JoinFS Hub (6112 UDP)
 
 Browser/client →  Caddy (443, TLS)
                        ├── /ws/*  → JoinFS WebSocket (8765)
-                       └── /usertochannel, /users, /channels, /channel, /move
+                       └── /usertochannel, /atcstation, /users, /channels, /channel, /move
                                   → TS Query API (8081)
                                        ↓ ServerQuery (10011)
                                   TeamSpeak 3 (9987 UDP)
@@ -246,7 +246,8 @@ To avoid unwanted automatic channel switching is to ensure the TS-Username doesn
 ### The safety guarantee: manually created channels are never touched
 
 Step 5 is gated by an in-memory "did I just create this channel in this request" flag —
-there is no `channeldelete` call anywhere in this codebase. If step 2 finds an
+there is no `channeldelete` call in the `/usertochannel` code path (the only deletion in this
+codebase is the ATC route below, restricted to temporary channels named like a station callsign). If step 2 finds an
 **already-existing** channel via its topic — including one a TeamSpeak admin created by
 hand through the TeamSpeak client — that flag is never set, so steps 3 and 5 are skipped
 entirely. The app moves the pilot into it and otherwise leaves it completely alone: no flag
@@ -268,6 +269,42 @@ are ever flagged temporary and auto-removed by TeamSpeak when they empty out.
   shown in everyone's JoinFS hub list. It has nothing to do with TeamSpeak channels or topics.
 - **Callsign** is the pilot/aircraft identifier JoinFS sends in the webhook payload, used only
   to find which TS3 client to move (the nickname-matching rule in step 1 above).
+
+
+## ATC stations: temporary channels
+
+An ATC station (EuroScope bridge or a future JoinFS ATC layer) reports itself like a COM update:
+
+```
+PUT http://tsapi:8081/atcstation        (publicly: https://<CADDY_DOMAIN>/atcstation)
+{
+  "comsupdate": [
+    { "callsign": "EDDS_ATIS", "com1": "123.130", "text": "STUTTGART INFORMATION B ...", "online": true }
+  ]
+}
+```
+
+| Field | Required | Becomes |
+|---|---|---|
+| `callsign` | yes (`A-Z a-z 0-9 _`, 2-30 chars) | channel **name** |
+| `com1` | when `online` (`118.800` format) | channel **topic** (so `/usertochannel` routes pilots in) |
+| `text` | no (absent = keep, `""` = clear; max ~4000 bytes) | channel **description** |
+| `online` | yes (boolean) | `true` = ensure channel, `false` = station left |
+
+Per entry the response contains `action`: `created`, `updated`, `unchanged`, `deleted`, `delete_pending` or `noop`
+(plus errors per entry). The route is idempotent.
+
+- **Lifetime:** the channel is a TeamSpeak *temporary* channel with `channel_delete_delay` =
+  `ATC_CHANNEL_STALE_TIMEOUT` seconds (`.env`, default `10800` = 3 h, max 65535). TeamSpeak removes it after it has
+  been empty that long; every report of an online station refreshes the timeout.
+- **`online: false`:** an empty channel is deleted at once. If users are inside, the timeout is set to 0, so the
+  channel disappears as soon as the last user leaves. An unknown station is ignored (nothing is created).
+- **Safety:** only a *temporary* channel whose name equals the reported callsign is ever modified or deleted;
+  permanent or manually created channels are left alone. A temporary pilot-created frequency channel with the same
+  topic is renamed to the callsign instead of being duplicated.
+- **No authentication:** like `/usertochannel`, the route is open to anyone who can reach it. Restrict it at the
+  network level if that matters to you.
+- `ts3init.py` grants the required permission `i_channel_create_modify_with_temp_delete_delay`.
 
 ---
 
@@ -448,7 +485,7 @@ The `caddy` container terminates TLS on port 443 for everything external HTTPS/W
 
 - `https://<CADDY_DOMAIN>/ws/` — proxies (with the `/ws` prefix stripped) to the JoinFS
   WebSocket feed on `joinfs:8765`.
-- `https://<CADDY_DOMAIN>/usertochannel`, `/users`, `/channels`, `/channel`, `/move` — proxy
+- `https://<CADDY_DOMAIN>/usertochannel`, `/atcstation`, `/users`, `/channels`, `/channel`, `/move` — proxy
   as-is to `tsapi:8081`.
 
 Routing is defined in [Caddyfile](Caddyfile), read via a bind-mounted volume. The only
@@ -474,6 +511,7 @@ Reachable through Caddy at `https://<CADDY_DOMAIN>/<path>` (see [TLS with Caddy]
 | Method | Path | Description |
 |---|---|---|
 | `PUT` | **`/usertochannel`** | Move pilot to COM frequency channel (called by JoinFS webhook) |
+| `PUT` | **`/atcstation`** | Create/update/remove the temporary channel of an ATC station (see [ATC stations](#atc-stations-temporary-channels)) |
 | `GET` | `/users` | List connected TS3 clients |
 | `GET` | `/channels` | List TS3 channels |
 | `PUT` | `/channel` | Create a channel manually |
