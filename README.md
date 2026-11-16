@@ -483,8 +483,8 @@ docker compose pull && docker compose up -d
 
 The `caddy` container terminates TLS on port 443 for everything external HTTPS/WSS clients need:
 
-- `https://<CADDY_DOMAIN>/ws/` — proxies (with the `/ws` prefix stripped) to the JoinFS
-  WebSocket feed on `joinfs:8765`.
+- `https://<CADDY_DOMAIN>/ws/` — proxies, with the path unchanged, to the JoinFS
+  WebSocket feed on `joinfs:8765`. JoinFS only serves URLs under `/ws/`, so the prefix must not be stripped.
 - `https://<CADDY_DOMAIN>/usertochannel`, `/atcstation`, `/users`, `/channels`, `/channel`, `/move` — proxy
   as-is to `tsapi:8081`.
 
