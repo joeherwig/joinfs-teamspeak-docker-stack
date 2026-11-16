@@ -45,6 +45,7 @@ write_files:
       CADDY_DOMAIN=CHANGE_ME_CADDY_DOMAIN
       DOCKERHUB_USERNAME=joeherwig
       FLASK_DEBUG=0
+      ATC_CHANNEL_STALE_TIMEOUT=10800
 
   - path: /opt/joinfs/Caddyfile
     permissions: '0644'
@@ -58,7 +59,7 @@ write_files:
       	}
 
       	# tsapi's Flask routes, proxied as-is (no path rewriting).
-      	@api path /usertochannel* /users* /channels* /channel* /move*
+      	@api path /usertochannel* /users* /channels* /channel* /move* /atcstation*
       	handle @api {
       		reverse_proxy tsapi:8081
       	}
@@ -119,6 +120,7 @@ write_files:
           ('i_client_move_power', 100),
           ('i_channel_create_child_modify_power', 75),
           ('i_channel_modify_power', 75),
+          ('i_channel_create_modify_with_temp_delete_delay', 65535),  # ATC station channels (tsapi /atcstation)
       ]
 
       # Static channel tree, in display order. Created once; existing channels are never modified
@@ -493,6 +495,7 @@ write_files:
             TS3_QUERY_USER: serveradmin
             TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
             FLASK_DEBUG: ${FLASK_DEBUG:-0}
+            ATC_CHANNEL_STALE_TIMEOUT: ${ATC_CHANNEL_STALE_TIMEOUT:-10800}
 
         joinfs:
           image: joeherwig/joinfs-console:latest

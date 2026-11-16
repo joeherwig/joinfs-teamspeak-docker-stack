@@ -58,6 +58,7 @@ services:
       TS3_QUERY_USER: serveradmin
       TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
       FLASK_DEBUG: ${FLASK_DEBUG:-0}
+      ATC_CHANNEL_STALE_TIMEOUT: ${ATC_CHANNEL_STALE_TIMEOUT:-10800}
 
   joinfs:
     image: joeherwig/joinfs-console:latest

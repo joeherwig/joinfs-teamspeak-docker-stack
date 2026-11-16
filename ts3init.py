@@ -36,6 +36,7 @@ INT_PERMS = [
     ('i_client_move_power', 100),
     ('i_channel_create_child_modify_power', 75),
     ('i_channel_modify_power', 75),
+    ('i_channel_create_modify_with_temp_delete_delay', 65535),  # ATC station channels (tsapi /atcstation)
 ]
 
 # Static channel tree, in display order. Created once; existing channels are never modified
