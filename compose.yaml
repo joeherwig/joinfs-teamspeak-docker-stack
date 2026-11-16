@@ -79,7 +79,7 @@ services:
     volumes:
       - atis_audio:/data/audio:ro
     read_only: true
-    tmpfs: ["/tmp", "/home/ts3ab"]
+    tmpfs: ["/tmp", "/home/ts3ab:uid=10002,gid=10002,mode=0700"]   # bot runs as uid 10002; plain tmpfs is root-owned
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 512m
