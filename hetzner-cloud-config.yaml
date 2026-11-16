@@ -51,9 +51,10 @@ write_files:
     owner: root:root
     content: |
       {$CADDY_DOMAIN} {
-      	# JoinFS live aircraft WebSocket feed, exposed at /ws/ and proxied to the
-      	# JoinFS hub's websocket listener at its own root path.
-      	handle_path /ws/* {
+      	# JoinFS live aircraft WebSocket feed. JoinFS's HttpListener only serves URLs under
+      	# /ws/ (WebSocketServer.cs), so the path is forwarded unchanged - do NOT strip the prefix
+      	# (handle_path) or JoinFS answers 404.
+      	handle /ws/* {
       		reverse_proxy joinfs:8765
       	}
 
