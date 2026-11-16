@@ -308,7 +308,7 @@ Per entry the response contains `action`: `created`, `updated`, `unchanged`, `de
 
 ### ATIS agent (spoken ATIS in `*_ATIS` channels) — optional
 
-The [joinfs-atis-agent](https://github.com/joeherwig/joinfs-atis-agent) reads the **description** of every channel
+The [teamspeak-atis-agent](https://github.com/joeherwig/teamspeak-atis-agent) reads the **description** of every channel
 whose name ends in `_ATIS`, renders it with an offline TTS voice (a different English voice per station) and a bot
 plays it in a loop in that channel; changing the description plays the new text. It is off by default — enable it with
 the `atis` compose profile:
