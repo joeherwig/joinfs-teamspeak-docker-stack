@@ -29,6 +29,9 @@ services:
       TS3SERVER_DB_WAITUNTILREADY: 30
       TS3SERVER_LICENSE: accept
       TS3SERVER_SERVERADMIN_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
+    networks:
+      - default
+      - atis     # lets the ATIS bot and agent reach the server (unused without the atis profile)
 
   ts3init:
     image: python:3.12-alpine
@@ -62,16 +65,17 @@ services:
 
   # --- ATIS agent (optional; enable with `docker compose --profile atis up -d`) -----------------------
   # Reads the description of every *_ATIS channel, renders it with Piper and has a bot loop it in the channel.
-  # Neither service publishes a port; the bot's web API is reachable from the compose network only.
+  # Neither service publishes a port. They sit on their own network with FIXED addresses: the bot's web API has no
+  # token, it only accepts requests from the agent's address (ATIS_AGENT_IP below must equal the agent's address).
   ts3audiobot:
     profiles: ["atis"]
-    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.0}
+    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.1}
     restart: unless-stopped
     depends_on:
       - teamspeak
     environment:
       TS3_ADDRESS: teamspeak
-      ATIS_BOT_TOKEN: ${ATIS_BOT_TOKEN:-}
+      ATIS_AGENT_IP: 172.28.200.10
     volumes:
       - atis_audio:/data/audio:ro
     read_only: true
@@ -79,10 +83,12 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 512m
+    networks:
+      atis: {ipv4_address: 172.28.200.11}
 
   atis-agent:
     profiles: ["atis"]
-    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.0}
+    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.1}
     restart: unless-stopped
     depends_on:
       - teamspeak
@@ -92,8 +98,7 @@ services:
       TS3_QUERY_PORT: "10011"
       TS3_QUERY_USER: serveradmin
       TS3_QUERY_PASSWORD: ${TS3_SERVERADMIN_PASSWORD}
-      ATIS_BOT_URL: http://ts3audiobot:58913
-      ATIS_BOT_TOKEN: ${ATIS_BOT_TOKEN:-}
+      ATIS_BOT_URL: http://172.28.200.11:58913
       ATIS_VOICE_MAP: ${ATIS_VOICE_MAP:-}
       ATIS_LEAVE_DELAY: ${ATIS_LEAVE_DELAY:-30}
       ATIS_MAX_IDLE: ${ATIS_MAX_IDLE:-0}
@@ -104,6 +109,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     mem_limit: 1g
+    networks:
+      atis: {ipv4_address: 172.28.200.10}
 
   joinfs:
     image: joeherwig/joinfs-console:latest
@@ -153,6 +160,12 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+
+networks:
+  atis:
+    ipam:
+      config:
+        - subnet: 172.28.200.0/24
 
 volumes:
   db_data:

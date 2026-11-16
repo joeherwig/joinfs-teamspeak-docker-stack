@@ -314,19 +314,23 @@ plays it in a loop in that channel; changing the description plays the new text.
 the `atis` compose profile:
 
 ```bash
-# .env: set ATIS_BOT_TOKEN (openssl rand -hex 32), see .env.example
 docker compose --profile atis up -d
 ```
 
 - The bot is in a channel while a human is there **or** the channel has a normal delete delay; with `online:false`
   (delay 0) it leaves shortly after the last human so the channel can be removed. A channel containing the bot is
   never empty, so the stale timeout cannot remove it — set `ATIS_MAX_IDLE` if that matters.
-- Neither container publishes a port, both run non-root with a read-only filesystem and no capabilities.
-- The bot is named `ATIS-<ICAO>` and never equals a callsign, so `/usertochannel` ignores it.
-- **Status:** the agent is implemented; the bot image (`ts3audiobot`) is still an experimental spike — see the agent
-  repo's `docs/ts3audiobot.md`. On a server: copy `compose.yaml` and update `.env` as described in
-  "Updating a running server via SSH", then `docker compose --profile atis up -d` (or add `--profile atis` to the
-  systemd unit's command).
+- Neither container publishes a port, both run non-root with a read-only filesystem and no capabilities. They share
+  the private network `atis` (172.28.200.0/24, agent `.10`, bot `.11`); the bot's web API has no token and only accepts
+  the agent's fixed address, so there is no extra secret. Change the subnet only together with `ATIS_AGENT_IP` /
+  `ATIS_BOT_URL` in `compose.yaml`, and make sure it does not collide with another Docker network on the host.
+- The bot appears as `ATIS-audiobot` (TeamSpeak adds a number if several are online), which never equals a callsign,
+  so `/usertochannel` ignores it. The agent creates a server group "ATIS Bot" (join permissions only) for it.
+- Audio files are deleted when the text changes, when the channel is deleted, and for channels that no longer exist
+  (checked on every scan, including after a restart).
+- On a server: copy `compose.yaml` and update `.env` as described in "Updating a running server via SSH", then
+  `docker compose --profile atis up -d` (or add `--profile atis` to the systemd unit's command). The images
+  `joeherwig/joinfs-atis-agent` and `joeherwig/joinfs-ts3audiobot` must be published at the pinned version first.
 
 ---
 
