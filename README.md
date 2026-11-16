@@ -324,7 +324,7 @@ docker compose --profile atis up -d
   the private network `atis` (172.28.200.0/24, agent `.10`, bot `.11`); the bot's web API has no token and only accepts
   the agent's fixed address, so there is no extra secret. Change the subnet only together with `ATIS_AGENT_IP` /
   `ATIS_BOT_URL` in `compose.yaml`, and make sure it does not collide with another Docker network on the host.
-- The bot appears as `ATIS-audiobot` (TeamSpeak adds a number if several are online), which never equals a callsign,
+- The bot in each channel is named `<ICAO>-ATIS-bot` (e.g. `EDDS-ATIS-bot`), which never equals a callsign,
   so `/usertochannel` ignores it. The agent creates a server group "ATIS Bot" (join permissions only) for it.
 - Audio files are deleted when the text changes, when the channel is deleted, and for channels that no longer exist
   (checked on every scan, including after a restart).

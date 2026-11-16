@@ -69,7 +69,7 @@ services:
   # token, it only accepts requests from the agent's address (ATIS_AGENT_IP below must equal the agent's address).
   ts3audiobot:
     profiles: ["atis"]
-    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.1}
+    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.2}
     restart: unless-stopped
     depends_on:
       - teamspeak
@@ -88,7 +88,7 @@ services:
 
   atis-agent:
     profiles: ["atis"]
-    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.1}
+    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.2}
     restart: unless-stopped
     depends_on:
       - teamspeak
