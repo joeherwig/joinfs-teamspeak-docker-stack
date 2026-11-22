@@ -46,7 +46,7 @@ services:
 
   tsapi:
     build: ./tsquery_api
-    image: joeherwig/joinfs-tsapi:latest
+    image: joeherwig/joinfs-tsapi:1.1.0
     depends_on:
       teamspeak:
         condition: service_started

@@ -483,7 +483,7 @@ write_files:
           command: python3 /ts3init.py
 
         tsapi:
-          image: joeherwig/joinfs-tsapi:latest
+          image: joeherwig/joinfs-tsapi:1.1.0
           restart: always
           depends_on:
             teamspeak:
