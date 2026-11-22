@@ -306,6 +306,28 @@ Per entry the response contains `action`: `created`, `updated`, `unchanged`, `de
   network level if that matters to you.
 - `ts3init.py` grants the required permission `i_channel_create_modify_with_temp_delete_delay`.
 
+### ATIS agent (spoken ATIS in `*_ATIS` channels) — optional
+
+The [teamspeak-atis-agent](https://github.com/joeherwig/teamspeak-atis-agent) reads the **description** of every channel
+whose name ends in `_ATIS`, renders it with an offline TTS voice (a different English voice per station) and a bot
+plays it in a loop in that channel; changing the description plays the new text. It is off by default — enable it with
+the `atis` compose profile:
+
+```bash
+# .env: set ATIS_BOT_TOKEN (openssl rand -hex 32), see .env.example
+docker compose --profile atis up -d
+```
+
+- The bot is in a channel while a human is there **or** the channel has a normal delete delay; with `online:false`
+  (delay 0) it leaves shortly after the last human so the channel can be removed. A channel containing the bot is
+  never empty, so the stale timeout cannot remove it — set `ATIS_MAX_IDLE` if that matters.
+- Neither container publishes a port, both run non-root with a read-only filesystem and no capabilities.
+- The bot is named `ATIS-<ICAO>` and never equals a callsign, so `/usertochannel` ignores it.
+- **Status:** the agent is implemented; the bot image (`ts3audiobot`) is still an experimental spike — see the agent
+  repo's `docs/ts3audiobot.md`. On a server: copy `compose.yaml` and update `.env` as described in
+  "Updating a running server via SSH", then `docker compose --profile atis up -d` (or add `--profile atis` to the
+  systemd unit's command).
+
 ---
 
 ## Publishing images to Docker Hub
@@ -483,8 +505,8 @@ docker compose pull && docker compose up -d
 
 The `caddy` container terminates TLS on port 443 for everything external HTTPS/WSS clients need:
 
-- `https://<CADDY_DOMAIN>/ws/` — proxies (with the `/ws` prefix stripped) to the JoinFS
-  WebSocket feed on `joinfs:8765`.
+- `https://<CADDY_DOMAIN>/ws/` — proxies, with the path unchanged, to the JoinFS
+  WebSocket feed on `joinfs:8765`. JoinFS only serves URLs under `/ws/`, so the prefix must not be stripped.
 - `https://<CADDY_DOMAIN>/usertochannel`, `/atcstation`, `/users`, `/channels`, `/channel`, `/move` — proxy
   as-is to `tsapi:8081`.
 
