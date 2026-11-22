@@ -3,6 +3,7 @@ name: Build and publish Docker images
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*.*.*" ]   # git tag v1.1.0 -> image tags 1.1.0, 1.1 and v1.1.0
   workflow_dispatch:
 
 jobs:
@@ -24,11 +25,23 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/joinfs-tsapi
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - name: Build and push joinfs-tsapi
         uses: docker/build-push-action@v5
         with:
           context: ./tsquery_api
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/joinfs-tsapi:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
