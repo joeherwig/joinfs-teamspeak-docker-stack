@@ -49,7 +49,7 @@ services:
 
   tsapi:
     build: ./tsquery_api
-    image: joeherwig/joinfs-tsapi:latest
+    image: joeherwig/joinfs-tsapi:1.1.0
     depends_on:
       teamspeak:
         condition: service_started
@@ -69,13 +69,14 @@ services:
   # token, it only accepts requests from the agent's address (ATIS_AGENT_IP below must equal the agent's address).
   ts3audiobot:
     profiles: ["atis"]
-    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.2}
+    image: ${ATIS_BOT_IMAGE:-joeherwig/joinfs-ts3audiobot:0.1.3}
     restart: unless-stopped
     depends_on:
       - teamspeak
     environment:
       TS3_ADDRESS: teamspeak
       ATIS_AGENT_IP: 172.28.200.10
+      ATIS_MAX_BOTS: "60"
     volumes:
       - atis_audio:/data/audio:ro
     read_only: true
@@ -88,7 +89,7 @@ services:
 
   atis-agent:
     profiles: ["atis"]
-    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:0.1.2}
+    image: ${ATIS_AGENT_IMAGE:-joeherwig/joinfs-atis-agent:1.0.2}
     restart: unless-stopped
     depends_on:
       - teamspeak
@@ -102,6 +103,7 @@ services:
       ATIS_VOICE_MAP: ${ATIS_VOICE_MAP:-}
       ATIS_LEAVE_DELAY: ${ATIS_LEAVE_DELAY:-30}
       ATIS_MAX_IDLE: ${ATIS_MAX_IDLE:-0}
+      ATIS_MAX_BOTS: 60
     volumes:
       - atis_audio:/data/audio
     read_only: true
@@ -113,8 +115,7 @@ services:
       atis: {ipv4_address: 172.28.200.10}
 
   joinfs:
-    image: joeherwig/joinfs-console:latest
-
+    image: joinfs/joinfs-console:26.7
     container_name: joinfs
     command:
       - --hub
@@ -136,6 +137,7 @@ services:
       - --comswebhookmethod
       - PUT
       - --websocketlog
+      - --feedfullrate
     volumes:
       - joinfs_data:/JoinFS-CONSOLE/JoinFS-CONSOLE
     ports:
